@@ -1,30 +1,16 @@
 """
 relay.py — RemoteDesk Relay Server (WebSocket)
-Kompatibel dengan Railway, Render, Fly.io, VPS biasa.
-
-Deploy ke Railway:
-  1. Buat repo GitHub, upload file ini
-  2. New Project di Railway → Deploy from GitHub
-  3. Railway otomatis detect Python dan jalankan
-  4. Settings → Networking → Generate Domain
-  5. Catat domain Railway (misal: relay-xxx.up.railway.app)
-
-Install lokal: pip install websockets
-Jalankan lokal: python3 relay.py
+Kompatibel Railway, Render, Fly.io, VPS biasa.
 """
 
-import asyncio
-import json
-import os
-import time
+import asyncio, json, os, time, signal, sys
 import websockets
 from websockets.server import serve
 
-PORT      = int(os.environ.get("PORT", 8765))  # Railway inject PORT otomatis
-ROOM_TTL  = 120  # detik sebelum room expired
+PORT     = int(os.environ.get("PORT", 8765))
+ROOM_TTL = 120
 
-# ── Room manager ──────────────────────────────────────────────────
-rooms = {}  # code -> {"server": ws, "client": ws, "created": time}
+rooms = {}
 
 def generate_code():
     import random, string
@@ -38,7 +24,7 @@ def log(msg):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ── Relay dua arah ────────────────────────────────────────────────
-async def pipe(src, dst, label):
+async def pipe(src, dst):
     try:
         async for msg in src:
             await dst.send(msg)
@@ -48,14 +34,17 @@ async def pipe(src, dst, label):
 # ── Handler koneksi ───────────────────────────────────────────────
 async def handler(ws):
     ip = ws.remote_address[0] if ws.remote_address else "?"
+
+    # Cek apakah ini HTTP health check dari Railway
+    # Railway kirim ping HTTP, websockets library handle upgrade otomatis
+    # kalau bukan WebSocket upgrade, koneksi akan ditolak library — itu normal
+
     try:
-        # Terima pesan pertama: identitas role
         raw  = await asyncio.wait_for(ws.recv(), timeout=15)
-        info = json.loads(raw)
+        info = json.loads(raw if isinstance(raw, str) else raw.decode())
         role = info.get("role")
         code = info.get("code", "").strip()
 
-        # ── PC Server daftar, minta kode ──────────────────────────
         if role == "server":
             code = generate_code()
             rooms[code] = {"server": ws, "client": None, "created": time.time()}
@@ -70,23 +59,24 @@ async def handler(ws):
                     break
                 await asyncio.sleep(0.5)
             else:
-                await ws.send(json.dumps({"type": "error", "msg": "Timeout"}))
+                log(f"[{code}] Timeout")
+                try: await ws.send(json.dumps({"type":"error","msg":"Timeout"}))
+                except: pass
                 rooms.pop(code, None)
                 return
 
             client_ws = rooms[code]["client"]
-            await ws.send(json.dumps({"type": "client_joined"}))
+            try: await ws.send(json.dumps({"type": "client_joined"}))
+            except: pass
             log(f"[{code}] Relay dimulai")
 
-            # Relay dua arah serentak
             await asyncio.gather(
-                pipe(ws,        client_ws, "srv→cli"),
-                pipe(client_ws, ws,        "cli→srv"),
+                pipe(ws, client_ws),
+                pipe(client_ws, ws),
             )
             log(f"[{code}] Relay selesai")
             rooms.pop(code, None)
 
-        # ── PC Client minta join ───────────────────────────────────
         elif role == "client":
             if not code or code not in rooms:
                 await ws.send(json.dumps({
@@ -98,51 +88,85 @@ async def handler(ws):
             room = rooms[code]
             if room["client"] is not None:
                 await ws.send(json.dumps({
-                    "type": "error",
-                    "msg":  "Sesi sudah dipakai"
+                    "type": "error", "msg": "Sesi sudah dipakai"
                 }))
                 return
 
             room["client"] = ws
-            log(f"[{code}] Client dari {ip} join")
+            log(f"[{code}] Client dari {ip}")
             await ws.send(json.dumps({"type": "joined"}))
-            # Tunggu relay selesai (dikelola thread server)
             await ws.wait_closed()
 
         else:
-            await ws.send(json.dumps({"type": "error", "msg": "Role tidak valid"}))
+            await ws.send(json.dumps({"type":"error","msg":"Role tidak valid"}))
 
     except asyncio.TimeoutError:
         log(f"Timeout dari {ip}")
     except Exception as e:
         log(f"Error dari {ip}: {e}")
 
-# ── Cleanup room expired ──────────────────────────────────────────
+# ── Cleanup ───────────────────────────────────────────────────────
 async def cleanup():
     while True:
         await asyncio.sleep(60)
-        now     = time.time()
-        expired = [c for c, r in rooms.items()
-                   if r["client"] is None and now - r["created"] > ROOM_TTL]
+        now = time.time()
+        expired = [c for c,r in list(rooms.items())
+                   if r["client"] is None and now-r["created"] > ROOM_TTL]
         for c in expired:
             log(f"[{c}] Room expired")
             rooms.pop(c, None)
 
-# ── Status endpoint sederhana (HTTP GET /) ────────────────────────
-async def status_handler(ws):
-    # WebSocket tidak untuk status, tapi Railway butuh health check HTTP
-    # Gunakan proses terpisah atau biarkan Railway pakai port check
-    pass
+# ── Health check HTTP sederhana (untuk Railway) ───────────────────
+async def health_check(reader, writer):
+    try:
+        await reader.read(1024)
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: 2\r\n"
+            b"\r\n"
+            b"OK"
+        )
+        writer.write(response)
+        await writer.drain()
+    except:
+        pass
+    finally:
+        writer.close()
 
 # ── Main ──────────────────────────────────────────────────────────
 async def main():
-    log(f"RemoteDesk Relay (WebSocket) — port {PORT}")
+    log(f"RemoteDesk Relay — port {PORT}")
     asyncio.create_task(cleanup())
-    async with serve(handler, "0.0.0.0", PORT,
-                     ping_interval=20, ping_timeout=60,
-                     max_size=10 * 1024 * 1024):  # max 10MB per pesan
-        log("Siap menerima koneksi...")
-        await asyncio.Future()  # jalan selamanya
+
+    # WebSocket server
+    ws_server = await serve(
+        handler, "0.0.0.0", PORT,
+        ping_interval=20,
+        ping_timeout=60,
+        max_size=10 * 1024 * 1024,
+        # process_request untuk handle HTTP health check
+        process_request=process_request,
+    )
+    log("Siap menerima koneksi...")
+    await asyncio.Future()
+
+async def process_request(connection, request):
+    """
+    Intercept HTTP request sebelum WebSocket upgrade.
+    Railway health check kirim HTTP GET — kita balas 200 OK.
+    Request WebSocket upgrade dibiarkan lanjut (return None).
+    """
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        # Ini HTTP biasa (health check) — balas 200 OK
+        from websockets.http11 import Response
+        return Response(
+            status_code=200,
+            headers={"Content-Type": "text/plain", "Content-Length": "2"},
+            body=b"OK",
+        )
+    # WebSocket upgrade — biarkan lanjut normal
+    return None
 
 if __name__ == "__main__":
     asyncio.run(main())
